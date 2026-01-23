@@ -1,94 +1,225 @@
-#!/usr/bin/python
+#!/usr/bin/env python3
 
 import csv
+import subprocess
 import os
 import sys
 import netifaces as nif
 
+
 def usage():
-    print 'Usage: \t', sys.argv[0], 'set ip-list latency-list iface-name'
-    print '\tOR:\t', sys.argv[0], 'unset iface-name'
+    print("Usage: \t", sys.argv[0], "set ip-list latency-list iface-name")
+    print("\tOR:\t", sys.argv[0], "unset iface-name")
     exit()
+
+
+def run_command(cmd_list):
+    """Executes system commands. Script must be run as root."""
+    try:
+        subprocess.run(cmd_list, check=True, capture_output=True, text=True)
+    except subprocess.CalledProcessError as e:
+        # We ignore errors for 'del' as the qdisc might not exist yet
+        if "del" not in cmd_list:
+            print(f"Error executing {' '.join(cmd_list)}: {e.stderr}")
+
+
+if os.geteuid() != 0:
+    print("This script must be run as root. Please use: sudo", sys.argv[0], "...")
+    sys.exit(1)
 
 if len(sys.argv) < 3:
     usage()
 
-if sys.argv[1] == 'unset':
-    command = 'sudo tc qdisc del dev ' + sys.argv[2] + ' root'
-    os.system(command)
+if sys.argv[1] == "unset":
+    iface = sys.argv[2]
+    print(f"# Removing tc rules for {iface}")
+    run_command(["tc", "qdisc", "del", "dev", iface, "root"])
     exit()
 
-if sys.argv[1] != 'set':
+if sys.argv[1] != "set":
     usage()
 
-#reads IP/Zone file
-ips = open(sys.argv[2], 'rb')
-ipD = csv.DictReader(ips)
-ipData = []
-
-for r in ipD:
-    ipData.append(r)
-
-#gets my address
+ips_file = sys.argv[2]
+lats_file = sys.argv[3]
 iface = sys.argv[4]
-myip = nif.ifaddresses(iface)[nif.AF_INET][0]['addr']
 
-#reads latency file
-with open(sys.argv[3], 'rb') as f:
-    reader = csv.reader(f)
-    lats = list(list(rec) for rec in csv.reader(f, delimiter=',')) #reads csv into a list of lists
+with open(ips_file, "r") as f:
+    ipData = list(csv.DictReader(f))
 
-myzone = ''
-for item in ipData:
-    if item['IP'] == myip:
-        myzone = item['Zone']
-
-if myzone == '':
-    print 'IP', myip, 'not in IP file'
+try:
+    myip = nif.ifaddresses(iface)[nif.AF_INET][0]["addr"]
+except (KeyError, ValueError, IndexError):
+    print(f"Error: Could not find IP for interface {iface}")
     exit()
 
-azs = lats[0]
+with open(lats_file, "r") as f:
+    lats_rows = list(csv.reader(f))
+
+# Find my zone
+myzone = next((item["Zone"] for item in ipData if item["IP"] == myip), "")
+if not myzone:
+    print(f"IP {myip} not in IP file")
+    exit()
+
+# Map latencies
+azs = lats_rows[0]
 tlats = {}
-for l in lats[1:]:
+for row in lats_rows[1:]:
+    row_zone = row[0]
     for i in range(1, len(azs)):
-        key = (l[0], azs[i])
-        value = float(l[i])
-        if value != 0:
-            tlats[key] = value
+        col_zone = azs[i]
+        try:
+            tlats[(row_zone, col_zone)] = float(row[i])
+        except (ValueError, IndexError):
+            continue
 
-print '# Setting rules for interface', iface, 'in zone', myzone, 'with IP', myip
+print(f"# Setting rules for interface {iface} in zone {myzone} with IP {myip}")
 
-command = 'sudo tc qdisc del dev ' + iface + ' root'
-os.system(command)
-command = 'sudo tc qdisc add dev ' + iface + ' root handle 1: htb default 10'
-os.system(command)
-command = 'sudo tc class add dev ' + iface + ' parent 1: classid 1:1 htb rate 1gbit'
-os.system(command)
-command = 'sudo tc class add dev ' + iface + ' parent 1:1 classid 1:10 htb rate 1gbit'
-os.system(command)
-command = 'sudo tc qdisc add dev ' + iface + ' parent 1:10 handle 10: sfq perturb 10'
-os.system(command)
+# Clear existing root (silently)
+run_command(["tc", "qdisc", "del", "dev", iface, "root"])
+
+run_command(
+    [
+        "tc",
+        "qdisc",
+        "add",
+        "dev",
+        iface,
+        "root",
+        "handle",
+        "1:",
+        "htb",
+        "default",
+        "10",
+        "r2q",
+        "1000",
+    ]
+)
+run_command(
+    [
+        "tc",
+        "class",
+        "add",
+        "dev",
+        iface,
+        "parent",
+        "1:",
+        "classid",
+        "1:1",
+        "htb",
+        "rate",
+        "1gbit",
+    ]
+)
+run_command(
+    [
+        "tc",
+        "class",
+        "add",
+        "dev",
+        iface,
+        "parent",
+        "1:1",
+        "classid",
+        "1:10",
+        "htb",
+        "rate",
+        "1gbit",
+    ]
+)
+run_command(
+    [
+        "tc",
+        "qdisc",
+        "add",
+        "dev",
+        iface,
+        "parent",
+        "1:10",
+        "handle",
+        "10:",
+        "sfq",
+        "perturb",
+        "10",
+    ]
+)
 
 nextHandle = 11
 for az in azs[1:]:
     lat = tlats.get((myzone, az))
-    if lat > 0:#az != myzone:
-        lat = tlats.get((myzone, az))
-        print '# Setting latency to', lat, 'ms for zone', az
-	if lat == None:
-            continue
-        delta = .05 * lat
-        print '# Setting latency to', lat, 'ms for zone', az
-        command = 'sudo tc class add dev ' + iface + ' parent 1:1 classid 1:' + str(nextHandle) + ' htb rate 1gbit'
-        os.system(command)
-        command = 'sudo tc qdisc add dev ' + iface + ' parent 1:' + str(nextHandle) + ' handle ' + str(
-            nextHandle) + ': netem delay ' + str(lat) + 'ms ' + str(delta) + 'ms distribution normal'
-        os.system(command)
+
+    # Apply rules if latency > 0
+    if lat is not None and lat > 0:
+        delta = 0.05 * lat
+        print(f"# Setting latency to {lat}ms for zone {az}")
+
+        # Create class for this zone
+        run_command(
+            [
+                "tc",
+                "class",
+                "add",
+                "dev",
+                iface,
+                "parent",
+                "1:1",
+                "classid",
+                f"1:{nextHandle}",
+                "htb",
+                "rate",
+                "1gbit",
+            ]
+        )
+
+        # Apply netem delay
+        run_command(
+            [
+                "tc",
+                "qdisc",
+                "add",
+                "dev",
+                iface,
+                "parent",
+                f"1:{nextHandle}",
+                "handle",
+                f"{nextHandle}:",
+                "netem",
+                "delay",
+                f"{lat}ms",
+                f"{delta}ms",
+                "distribution",
+                "normal",
+            ]
+        )
+
+        # Add filters for IPs in this zone
         for item in ipData:
-            if item['Zone'] == az:
-                ip = item['IP']
-                print '\t# Latency from', myip, 'to', ip, 'set to', lat, '+/-', delta
-                command = 'sudo tc filter add dev ' + iface + ' protocol ip parent 1: prio 1 u32 match ip dst ' + ip + '/32 flowid 1:' + str(
-                    nextHandle)
-                os.system(command)
+            if item["Zone"] == az:
+                target_ip = item["IP"]
+                print(
+                    f"\t# Latency from {myip} to {target_ip} set to {lat} +/- {delta}"
+                )
+                run_command(
+                    [
+                        "tc",
+                        "filter",
+                        "add",
+                        "dev",
+                        iface,
+                        "protocol",
+                        "ip",
+                        "parent",
+                        "1:",
+                        "prio",
+                        "1",
+                        "u32",
+                        "match",
+                        "ip",
+                        "dst",
+                        f"{target_ip}/32",
+                        "flowid",
+                        f"1:{nextHandle}",
+                    ]
+                )
+
         nextHandle += 1
