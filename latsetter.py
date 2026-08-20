@@ -17,6 +17,7 @@ import subprocess
 import sys
 
 RATE = "1gbit"
+LOCAL_RATE = "10gbit"
 
 
 def get_iface_ipv4(iface: str) -> str:
@@ -42,6 +43,203 @@ def run_command(cmd_list: list[str], *, ignore_errors: bool = False) -> None:
             print(f"Error executing {' '.join(cmd_list)}: {e.stderr}")
 
 
+def setup_root_qdisc(iface: str, rate: str) -> None:
+    """Install the HTB root qdisc with the default class on the interface."""
+    # Clear existing root (silently)
+    run_command(["tc", "qdisc", "del", "dev", iface, "root"], ignore_errors=True)
+
+    run_command(
+        [
+            "tc",
+            "qdisc",
+            "add",
+            "dev",
+            iface,
+            "root",
+            "handle",
+            "1:",
+            "htb",
+            "default",
+            "10",
+            "r2q",
+            "1000",
+        ]
+    )
+    run_command(
+        [
+            "tc",
+            "class",
+            "add",
+            "dev",
+            iface,
+            "parent",
+            "1:",
+            "classid",
+            "1:1",
+            "htb",
+            "rate",
+            rate,
+        ]
+    )
+    run_command(
+        [
+            "tc",
+            "class",
+            "add",
+            "dev",
+            iface,
+            "parent",
+            "1:1",
+            "classid",
+            "1:10",
+            "htb",
+            "rate",
+            rate,
+        ]
+    )
+    run_command(
+        [
+            "tc",
+            "qdisc",
+            "add",
+            "dev",
+            iface,
+            "parent",
+            "1:10",
+            "handle",
+            "10:",
+            "sfq",
+            "perturb",
+            "10",
+        ]
+    )
+
+
+def set_local(destinations_file: str, protocol: str) -> None:
+    """Install per-port latency rules on the loopback interface."""
+    with open(destinations_file, "r") as f:
+        raw_rows: list[list[str]] = list(csv.reader(f))
+
+    # Skip a header row if the first cell looks like "port".
+    rows = raw_rows
+    if rows and rows[0] and rows[0][0].strip().lower() == "port":
+        rows = rows[1:]
+
+    destinations: list[tuple[int, float]] = []
+    seen_ports: set[int] = set()
+    for row in rows:
+        if not row:
+            continue
+        try:
+            port = int(row[0])
+            latency = float(row[1])
+        except (ValueError, IndexError):
+            print(f"# warning: invalid row {row}", file=sys.stderr)
+            continue
+        if port in seen_ports:
+            print(
+                f"# warning: duplicate port {port}; keeping the first",
+                file=sys.stderr,
+            )
+            continue
+        if latency < 0:
+            print(
+                f"# warning: negative latency {latency} for port {port}",
+                file=sys.stderr,
+            )
+            continue
+        if latency == 0:
+            continue
+        if not 1 <= port <= 65535:
+            print(f"# warning: port {port} out of range", file=sys.stderr)
+            continue
+        seen_ports.add(port)
+        destinations.append((port, latency))
+
+    proto_num = 6 if protocol == "tcp" else 17
+
+    setup_root_qdisc("lo", LOCAL_RATE)
+
+    next_handle = 11
+    for port, lat in destinations:
+        delta = 0.05 * lat
+
+        run_command(
+            [
+                "tc",
+                "class",
+                "add",
+                "dev",
+                "lo",
+                "parent",
+                "1:1",
+                "classid",
+                f"1:{next_handle}",
+                "htb",
+                "rate",
+                LOCAL_RATE,
+            ]
+        )
+        run_command(
+            [
+                "tc",
+                "qdisc",
+                "add",
+                "dev",
+                "lo",
+                "parent",
+                f"1:{next_handle}",
+                "handle",
+                f"{next_handle}:",
+                "netem",
+                "delay",
+                f"{lat}ms",
+                f"{delta}ms",
+                "distribution",
+                "normal",
+            ]
+        )
+        run_command(
+            [
+                "tc",
+                "filter",
+                "add",
+                "dev",
+                "lo",
+                "protocol",
+                "ip",
+                "parent",
+                "1:",
+                "prio",
+                "1",
+                "u32",
+                "match",
+                "ip",
+                "dst",
+                "127.0.0.1/32",
+                "match",
+                "ip",
+                "protocol",
+                str(proto_num),
+                "0xff",
+                "match",
+                "ip",
+                "dport",
+                str(port),
+                "0xffff",
+                "flowid",
+                f"1:{next_handle}",
+            ]
+        )
+
+        print(f"# Setting latency to {lat}ms for port {port}")
+        print(f"\t# Latency to 127.0.0.1:{port} set to {lat} +/- {delta}")
+
+        next_handle += 1
+
+    print(f"# Applied {len(destinations)} latency rules on lo")
+
+
 def main() -> None:
     if os.geteuid() != 0:
         print("This script must be run as root. Please use: sudo", sys.argv[0], "...")
@@ -60,12 +258,29 @@ def main() -> None:
     unset_parser = subparsers.add_parser("unset", help="remove all latency rules")
     unset_parser.add_argument("iface", help="network interface name")
 
+    set_local_parser = subparsers.add_parser(
+        "set-local", help="apply per-port latency rules on the loopback interface"
+    )
+    set_local_parser.add_argument(
+        "destinations_file", help="CSV file with Port,Latency rows"
+    )
+    set_local_parser.add_argument(
+        "--protocol",
+        choices=["tcp", "udp"],
+        default="tcp",
+        help="IP protocol to match (default: tcp)",
+    )
+
     args = parser.parse_args()
 
     if args.command == "unset":
         iface = args.iface
         print(f"# Removing tc rules for {iface}")
         run_command(["tc", "qdisc", "del", "dev", iface, "root"], ignore_errors=True)
+        return
+
+    if args.command == "set-local":
+        set_local(args.destinations_file, args.protocol)
         return
 
     ips_file = args.ips_file
@@ -172,74 +387,7 @@ def main() -> None:
 
     print(f"# Setting rules for interface {iface} in zone {my_zone} with IP {my_ip}")
 
-    # Clear existing root (silently)
-    run_command(["tc", "qdisc", "del", "dev", iface, "root"], ignore_errors=True)
-
-    run_command(
-        [
-            "tc",
-            "qdisc",
-            "add",
-            "dev",
-            iface,
-            "root",
-            "handle",
-            "1:",
-            "htb",
-            "default",
-            "10",
-            "r2q",
-            "1000",
-        ]
-    )
-    run_command(
-        [
-            "tc",
-            "class",
-            "add",
-            "dev",
-            iface,
-            "parent",
-            "1:",
-            "classid",
-            "1:1",
-            "htb",
-            "rate",
-            RATE,
-        ]
-    )
-    run_command(
-        [
-            "tc",
-            "class",
-            "add",
-            "dev",
-            iface,
-            "parent",
-            "1:1",
-            "classid",
-            "1:10",
-            "htb",
-            "rate",
-            RATE,
-        ]
-    )
-    run_command(
-        [
-            "tc",
-            "qdisc",
-            "add",
-            "dev",
-            iface,
-            "parent",
-            "1:10",
-            "handle",
-            "10:",
-            "sfq",
-            "perturb",
-            "10",
-        ]
-    )
+    setup_root_qdisc(iface, RATE)
 
     next_handle = 11
     for az in zones[1:]:

@@ -6,39 +6,59 @@ Simulates the latencies among regions and availability zones, just like Amazon E
 
 Linux machine with `tc` (iproute2) installed; the script uses only the Python 3 standard library.
 
+## Installation
+
+Install the script to a directory in your PATH (defaults to `/usr/local/sbin`):
+
+    sudo make install
+
+or manually:
+
+    sudo install -m 755 latsetter.py /usr/local/sbin/latsetter
+
 ## Usage
 
-To set the latencies accordingly you will need two CSV files.
+### Cluster mode (`set` / `unset`)
 
-The first one provides the latency between pairs of availability zones (clusters),
-while the second associates the nodes IPs to the corresponding zones.
+Run once per node to emulate inter-zone latencies between machines. You need two CSV files:
 
-You can find an example of both files (`latencies.csv` and `ips.csv`) under `./doc/sample`
+- `ips.csv` — maps each node IP to its zone (header `Zone,IP`).
+- `latencies.csv` — latency matrix in ms (first row = destination zones, first column = source zones).
 
-To set the latency, simply run:
+Examples of both files are under `./sample`.
 
-    sudo latency-setter.py set <ip-csv> <latency-csv> <interface-name>
+To set the latencies for this node:
 
-The command will check if the IP address associated with the given interface is in IP file. If so,
-the latencies will be set according to the latencies file and the zone where the node IP belongs to.
+    sudo latsetter set <ips.csv> <latencies.csv> <interface-name>
 
-To undo the configuration, run:
+The script looks up the interface's IPv4 address in `ips.csv` to find this node's zone, then installs a delay rule per destination zone. To undo:
 
-    sudo latency-setter.py unset <interface-name>
+    sudo latsetter unset <interface-name>
 
+To set latencies for all nodes in a cluster, loop over the IPs:
+
+    for i in `tail -n +2 <ips.csv> | cut -d , -f 2`; do
+        ssh $i "sudo latsetter set <ips.csv> <latencies.csv> <interface-name>"
+    done
+
+### Local mode (`set-local`)
+
+Emulate per-destination latencies on a single machine: all processes run on `127.0.0.1` with distinct ports. Provide a CSV with the destination port and its latency in ms (header optional):
+
+    Port,Latency
+    8080,90
+    8081,90
+    8082,3
+
+Apply the rules (TCP by default; use `--protocol udp` for UDP):
+
+    sudo latsetter set-local destinations.csv
+
+To undo:
+
+    sudo latsetter unset lo
 
 ## Notes
 
 - You must run the commands as `root`
 - Don't forget to undo the changes after running your experiments
-- If you want to set the latencies for all the nodes, you can run the command in a loop:
-```
-for i in `cut -d , -f 2 <ip-csv>; do
-    ssh $i "sudo latency-setter set <ip-csv> <latency-csv> <interface-name>"
-done
-
-#you will get an error about the first line because it does not contain a valid IP
-
-```
-
-Have fun!
