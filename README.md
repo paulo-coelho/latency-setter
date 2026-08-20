@@ -4,7 +4,7 @@ Simulates the latencies among regions and availability zones, just like Amazon E
 
 ## Requirements
 
-Linux machine with `tc` command and python-netifaces installed.
+Linux machine with `tc` (iproute2) installed; the script uses only the Python 3 standard library.
 
 ## Usage
 

@@ -1,225 +1,326 @@
 #!/usr/bin/env python3
 
+"""Simulate EC2-style inter-zone latencies on a Linux host using tc.
+
+One-file Python script that emulates EC2-style inter-zone latencies on a
+Linux host via tc (HTB root -> per-zone classes -> netem + u32 filters).
+Run once per node with `set`; remove all rules with `unset`.
+"""
+
+import argparse
 import csv
-import subprocess
+import fcntl
 import os
+import socket
+import struct
+import subprocess
 import sys
-import netifaces as nif
+
+RATE = "1gbit"
 
 
-def usage():
-    print("Usage: \t", sys.argv[0], "set ip-list latency-list iface-name")
-    print("\tOR:\t", sys.argv[0], "unset iface-name")
-    exit()
+def get_iface_ipv4(iface: str) -> str:
+    """Return the IPv4 address bound to the given interface."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        addr = fcntl.ioctl(
+            s.fileno(), 0x8915, struct.pack("256s", iface.encode()[:15])
+        )[20:24]
+    except OSError as e:
+        raise ValueError(f"Could not find IP for interface {iface}: {e}") from e
+    finally:
+        s.close()
+    return socket.inet_ntoa(addr)
 
 
-def run_command(cmd_list):
+def run_command(cmd_list: list[str], *, ignore_errors: bool = False) -> None:
     """Executes system commands. Script must be run as root."""
     try:
         subprocess.run(cmd_list, check=True, capture_output=True, text=True)
     except subprocess.CalledProcessError as e:
-        # We ignore errors for 'del' as the qdisc might not exist yet
-        if "del" not in cmd_list:
+        if not ignore_errors:
             print(f"Error executing {' '.join(cmd_list)}: {e.stderr}")
 
 
-if os.geteuid() != 0:
-    print("This script must be run as root. Please use: sudo", sys.argv[0], "...")
-    sys.exit(1)
+def main() -> None:
+    if os.geteuid() != 0:
+        print("This script must be run as root. Please use: sudo", sys.argv[0], "...")
+        sys.exit(1)
 
-if len(sys.argv) < 3:
-    usage()
+    parser = argparse.ArgumentParser(
+        description="Simulate EC2-style inter-zone latencies on a Linux host using tc."
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
 
-if sys.argv[1] == "unset":
-    iface = sys.argv[2]
-    print(f"# Removing tc rules for {iface}")
-    run_command(["tc", "qdisc", "del", "dev", iface, "root"])
-    exit()
+    set_parser = subparsers.add_parser("set", help="apply latency rules for this node")
+    set_parser.add_argument("ips_file", help="CSV file with Zone,IP rows")
+    set_parser.add_argument("lats_file", help="CSV latency matrix (values in ms)")
+    set_parser.add_argument("iface", help="network interface name")
 
-if sys.argv[1] != "set":
-    usage()
+    unset_parser = subparsers.add_parser("unset", help="remove all latency rules")
+    unset_parser.add_argument("iface", help="network interface name")
 
-ips_file = sys.argv[2]
-lats_file = sys.argv[3]
-iface = sys.argv[4]
+    args = parser.parse_args()
 
-with open(ips_file, "r") as f:
-    ipData = list(csv.DictReader(f))
+    if args.command == "unset":
+        iface = args.iface
+        print(f"# Removing tc rules for {iface}")
+        run_command(["tc", "qdisc", "del", "dev", iface, "root"], ignore_errors=True)
+        return
 
-try:
-    myip = nif.ifaddresses(iface)[nif.AF_INET][0]["addr"]
-except (KeyError, ValueError, IndexError):
-    print(f"Error: Could not find IP for interface {iface}")
-    exit()
+    ips_file = args.ips_file
+    lats_file = args.lats_file
+    iface = args.iface
 
-with open(lats_file, "r") as f:
-    lats_rows = list(csv.reader(f))
+    with open(ips_file, "r") as f:
+        ip_data: list[dict[str, str]] = list(csv.DictReader(f))
 
-# Find my zone
-myzone = next((item["Zone"] for item in ipData if item["IP"] == myip), "")
-if not myzone:
-    print(f"IP {myip} not in IP file")
-    exit()
-
-# Map latencies
-azs = lats_rows[0]
-tlats = {}
-for row in lats_rows[1:]:
-    row_zone = row[0]
-    for i in range(1, len(azs)):
-        col_zone = azs[i]
-        try:
-            tlats[(row_zone, col_zone)] = float(row[i])
-        except (ValueError, IndexError):
+    # Warn about duplicate IPs; first row wins.
+    seen_ips: set[str] = set()
+    unique_ip_data: list[dict[str, str]] = []
+    for item in ip_data:
+        ip = item["IP"]
+        if ip in seen_ips:
+            print(
+                f"# warning: IP {ip} appears in more than one row of {ips_file}; keeping the first",
+                file=sys.stderr,
+            )
             continue
+        seen_ips.add(ip)
+        unique_ip_data.append(item)
+    ip_data = unique_ip_data
 
-print(f"# Setting rules for interface {iface} in zone {myzone} with IP {myip}")
+    try:
+        my_ip = get_iface_ipv4(iface)
+    except ValueError as e:
+        print(e)
+        sys.exit(1)
 
-# Clear existing root (silently)
-run_command(["tc", "qdisc", "del", "dev", iface, "root"])
+    with open(lats_file, "r") as f:
+        rows: list[list[str]] = list(csv.reader(f))
 
-run_command(
-    [
-        "tc",
-        "qdisc",
-        "add",
-        "dev",
-        iface,
-        "root",
-        "handle",
-        "1:",
-        "htb",
-        "default",
-        "10",
-        "r2q",
-        "1000",
-    ]
-)
-run_command(
-    [
-        "tc",
-        "class",
-        "add",
-        "dev",
-        iface,
-        "parent",
-        "1:",
-        "classid",
-        "1:1",
-        "htb",
-        "rate",
-        "1gbit",
-    ]
-)
-run_command(
-    [
-        "tc",
-        "class",
-        "add",
-        "dev",
-        iface,
-        "parent",
-        "1:1",
-        "classid",
-        "1:10",
-        "htb",
-        "rate",
-        "1gbit",
-    ]
-)
-run_command(
-    [
-        "tc",
-        "qdisc",
-        "add",
-        "dev",
-        iface,
-        "parent",
-        "1:10",
-        "handle",
-        "10:",
-        "sfq",
-        "perturb",
-        "10",
-    ]
-)
+    zones: list[str] = rows[0]
+    header_zones: set[str] = set(zones[1:])
 
-nextHandle = 11
-for az in azs[1:]:
-    lat = tlats.get((myzone, az))
+    # Warn about duplicate zone columns in the header.
+    seen_zones: set[str] = set()
+    for zone in zones[1:]:
+        if zone in seen_zones:
+            print(
+                f"# warning: duplicate zone column {zone} in latency matrix header",
+                file=sys.stderr,
+            )
+        seen_zones.add(zone)
 
-    # Apply rules if latency > 0
-    if lat is not None and lat > 0:
-        delta = 0.05 * lat
-        print(f"# Setting latency to {lat}ms for zone {az}")
+    # Warn about header zones with no matching matrix row.
+    row_zones: set[str] = {row[0] for row in rows[1:] if row}
+    for zone in zones[1:]:
+        if zone not in row_zones:
+            print(
+                f"# warning: zone {zone} in header has no matching matrix row; skipping",
+                file=sys.stderr,
+            )
 
-        # Create class for this zone
-        run_command(
-            [
-                "tc",
-                "class",
-                "add",
-                "dev",
-                iface,
-                "parent",
-                "1:1",
-                "classid",
-                f"1:{nextHandle}",
-                "htb",
-                "rate",
-                "1gbit",
-            ]
-        )
+    # Warn about matrix rows whose zone is not in the header.
+    for row in rows[1:]:
+        if row and row[0] not in header_zones:
+            print(
+                f"# warning: matrix row for zone {row[0]} not in header; data unused",
+                file=sys.stderr,
+            )
 
-        # Apply netem delay
-        run_command(
-            [
-                "tc",
-                "qdisc",
-                "add",
-                "dev",
-                iface,
-                "parent",
-                f"1:{nextHandle}",
-                "handle",
-                f"{nextHandle}:",
-                "netem",
-                "delay",
-                f"{lat}ms",
-                f"{delta}ms",
-                "distribution",
-                "normal",
-            ]
-        )
+    # Find my zone
+    my_zone = next((item["Zone"] for item in ip_data if item["IP"] == my_ip), "")
+    if not my_zone:
+        print(f"IP {my_ip} not in IP file")
+        sys.exit(1)
 
-        # Add filters for IPs in this zone
-        for item in ipData:
-            if item["Zone"] == az:
-                target_ip = item["IP"]
-                print(
-                    f"\t# Latency from {myip} to {target_ip} set to {lat} +/- {delta}"
-                )
-                run_command(
-                    [
-                        "tc",
-                        "filter",
-                        "add",
-                        "dev",
-                        iface,
-                        "protocol",
-                        "ip",
-                        "parent",
-                        "1:",
-                        "prio",
-                        "1",
-                        "u32",
-                        "match",
-                        "ip",
-                        "dst",
-                        f"{target_ip}/32",
-                        "flowid",
-                        f"1:{nextHandle}",
-                    ]
-                )
+    # Map latencies
+    lat_map: dict[tuple[str, str], float] = {}
+    warned_cells: set[tuple[str, str]] = set()
+    for row in rows[1:]:
+        row_zone = row[0]
+        for i in range(1, len(zones)):
+            col_zone = zones[i]
+            try:
+                lat_map[(row_zone, col_zone)] = float(row[i])
+            except (ValueError, IndexError):
+                if (row_zone, col_zone) not in warned_cells:
+                    print(
+                        f"# warning: empty or invalid latency for {row_zone} -> {col_zone}",
+                        file=sys.stderr,
+                    )
+                    warned_cells.add((row_zone, col_zone))
+                continue
 
-        nextHandle += 1
+    # Warn about zones in the matrix with no IP rows in ips.csv.
+    ip_zones: set[str] = {item["Zone"] for item in ip_data}
+    for zone in zones[1:]:
+        if zone not in ip_zones:
+            print(
+                f"# warning: zone {zone} has no IP rows in {ips_file}; rules will match nothing",
+                file=sys.stderr,
+            )
+
+    # Warn about ips.csv zones not present in the matrix header.
+    for item in ip_data:
+        if item["Zone"] not in header_zones:
+            print(
+                f"# warning: zone {item['Zone']} in {ips_file} not in latency matrix header; no rules will apply",
+                file=sys.stderr,
+            )
+
+    print(f"# Setting rules for interface {iface} in zone {my_zone} with IP {my_ip}")
+
+    # Clear existing root (silently)
+    run_command(["tc", "qdisc", "del", "dev", iface, "root"], ignore_errors=True)
+
+    run_command(
+        [
+            "tc",
+            "qdisc",
+            "add",
+            "dev",
+            iface,
+            "root",
+            "handle",
+            "1:",
+            "htb",
+            "default",
+            "10",
+            "r2q",
+            "1000",
+        ]
+    )
+    run_command(
+        [
+            "tc",
+            "class",
+            "add",
+            "dev",
+            iface,
+            "parent",
+            "1:",
+            "classid",
+            "1:1",
+            "htb",
+            "rate",
+            RATE,
+        ]
+    )
+    run_command(
+        [
+            "tc",
+            "class",
+            "add",
+            "dev",
+            iface,
+            "parent",
+            "1:1",
+            "classid",
+            "1:10",
+            "htb",
+            "rate",
+            RATE,
+        ]
+    )
+    run_command(
+        [
+            "tc",
+            "qdisc",
+            "add",
+            "dev",
+            iface,
+            "parent",
+            "1:10",
+            "handle",
+            "10:",
+            "sfq",
+            "perturb",
+            "10",
+        ]
+    )
+
+    next_handle = 11
+    for az in zones[1:]:
+        lat = lat_map.get((my_zone, az))
+
+        # Apply rules if latency > 0
+        if lat is not None and lat > 0:
+            delta = 0.05 * lat
+            print(f"# Setting latency to {lat}ms for zone {az}")
+
+            # Create class for this zone
+            run_command(
+                [
+                    "tc",
+                    "class",
+                    "add",
+                    "dev",
+                    iface,
+                    "parent",
+                    "1:1",
+                    "classid",
+                    f"1:{next_handle}",
+                    "htb",
+                    "rate",
+                    RATE,
+                ]
+            )
+
+            # Apply netem delay
+            run_command(
+                [
+                    "tc",
+                    "qdisc",
+                    "add",
+                    "dev",
+                    iface,
+                    "parent",
+                    f"1:{next_handle}",
+                    "handle",
+                    f"{next_handle}:",
+                    "netem",
+                    "delay",
+                    f"{lat}ms",
+                    f"{delta}ms",
+                    "distribution",
+                    "normal",
+                ]
+            )
+
+            # Add filters for IPs in this zone
+            for item in ip_data:
+                if item["Zone"] == az:
+                    target_ip = item["IP"]
+                    print(
+                        f"\t# Latency from {my_ip} to {target_ip} set to {lat} +/- {delta}"
+                    )
+                    run_command(
+                        [
+                            "tc",
+                            "filter",
+                            "add",
+                            "dev",
+                            iface,
+                            "protocol",
+                            "ip",
+                            "parent",
+                            "1:",
+                            "prio",
+                            "1",
+                            "u32",
+                            "match",
+                            "ip",
+                            "dst",
+                            f"{target_ip}/32",
+                            "flowid",
+                            f"1:{next_handle}",
+                        ]
+                    )
+
+            next_handle += 1
+
+
+if __name__ == "__main__":
+    main()
